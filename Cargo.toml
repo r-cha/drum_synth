@@ -11,7 +11,7 @@ description = "Realistic synthetic drums"
 members = ["xtask"]
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rand = "0.8.4"
@@ -19,7 +19,11 @@ rand = "0.8.4"
 # thread in debug builds.
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = [
     "assert_process_allocs",
+    "standalone"
 ] }
+nih_plug_vizia = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+# Needed for the custom knobs and styling
+vizia = { version = "0.2.0", git = "https://github.com/vizia/vizia" }
 # Uncomment the below line to disable the on-by-default VST3 feature to remove
 # the GPL compatibility requirement
 # nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", default-features = false, features = ["assert_process_allocs"] }

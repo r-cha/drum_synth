@@ -1,31 +1,155 @@
 use nih_plug::prelude::*;
+use nih_plug_vizia::ViziaState;
 use rand::Rng;
 use std::sync::Arc;
+use std::f32::consts::PI;
+
+mod ui;
+
 
 /// The maximum size of a delay buffer for resonance.
 /// ~100ms at 44.1kHz sample rate
 const MAX_DELAY: usize = 4096;
 
-struct DrumSynth {
+// We're not using this filter currently, but keeping it for future use
+#[allow(dead_code)]
+struct OnePoleFilter {
+    a0: f32,
+    b1: f32,
+    z1: f32,
+}
+
+#[allow(dead_code)]
+impl OnePoleFilter {
+    fn new() -> Self {
+        Self {
+            a0: 1.0,
+            b1: 0.0,
+            z1: 0.0,
+        }
+    }
+    
+    /// Set filter coefficients for low/high pass
+    /// cutoff should be 0.0-1.0 (normalized frequency)
+    fn set_cutoff(&mut self, cutoff: f32, lowpass: bool) {
+        let g = (PI * cutoff).tan();
+        let a1 = if lowpass { (g - 1.0) / (g + 1.0) } else { (1.0 - g) / (1.0 + g) };
+        self.a0 = (1.0 + a1) / 2.0;
+        self.b1 = a1;
+    }
+    
+    /// Process one sample through the filter
+    fn process(&mut self, input: f32) -> f32 {
+        let output = self.a0 * input + self.a0 * self.z1;
+        self.z1 = input - output * self.b1;
+        output
+    }
+    
+    /// Reset filter state
+    fn reset(&mut self) {
+        self.z1 = 0.0;
+    }
+}
+
+/// Simple peak EQ
+struct PeakEQ {
+    a0: f32,
+    a1: f32,
+    a2: f32,
+    b1: f32,
+    b2: f32,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl PeakEQ {
+    fn new() -> Self {
+        Self {
+            a0: 1.0,
+            a1: 0.0,
+            a2: 0.0,
+            b1: 0.0,
+            b2: 0.0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+    
+    /// Configure peak EQ
+    /// freq: 0.0-1.0 (normalized frequency)
+    /// gain: gain in dB
+    /// q: q factor (bandwidth)
+    fn configure(&mut self, freq: f32, gain: f32, q: f32, sample_rate: f32) {
+        let omega = 2.0 * PI * freq / sample_rate;
+        let alpha = (omega.sin()) / (2.0 * q);
+        let a = 10.0_f32.powf(gain / 40.0);
+        
+        let b0 = 1.0 + alpha * a;
+        let b1 = -2.0 * omega.cos();
+        let b2 = 1.0 - alpha * a;
+        let a0 = 1.0 + alpha / a;
+        let a1 = -2.0 * omega.cos();
+        let a2 = 1.0 - alpha / a;
+        
+        self.a0 = b0 / a0;
+        self.a1 = b1 / a0;
+        self.a2 = b2 / a0;
+        self.b1 = a1 / a0;
+        self.b2 = a2 / a0;
+    }
+    
+    /// Process one sample through the EQ
+    fn process(&mut self, input: f32) -> f32 {
+        let output = self.a0 * input + self.a1 * self.x1 + self.a2 * self.x2
+                   - self.b1 * self.y1 - self.b2 * self.y2;
+        
+        self.x2 = self.x1;
+        self.x1 = input;
+        self.y2 = self.y1;
+        self.y1 = output;
+        
+        output
+    }
+    
+    /// Reset filter state
+    fn reset(&mut self) {
+        self.x1 = 0.0;
+        self.x2 = 0.0;
+        self.y1 = 0.0;
+        self.y2 = 0.0;
+    }
+}
+
+pub struct DrumSynth {
     params: Arc<DrumSynthParams>,
     sample_rate: f32,
 
     // Transient layer
     transient_envelope: ADSREnvelope,
     transient_phase: f32,
+    transient_eq: PeakEQ,
 
     // Resonance layer
     resonance_buffer: Vec<f32>,
     resonance_write_pos: usize,
     resonance_read_pos: usize,
+    resonance_eq: PeakEQ,
 
     // Noise for snares
     noise_envelope: ADSREnvelope,
+    snare_eq: PeakEQ,
     
     // MIDI tracking
     midi_note_id: u8,
     midi_note_freq: f32,
     is_playing: bool,
+    
+    // VIZIA editor state
+    editor_state: Arc<ViziaState>,
 }
 
 struct ADSREnvelope {
@@ -131,57 +255,98 @@ impl ADSREnvelope {
     }
 
     fn is_active(&self) -> bool {
-        match self.state {
-            ADSRState::Idle => false,
-            _ => true,
-        }
+        !matches!(self.state, ADSRState::Idle)
     }
 }
 
 #[derive(Params)]
-struct DrumSynthParams {
+pub struct DrumSynthParams {
     #[id = "gain"]
     pub gain: FloatParam,
 
-    // Transient layer params
-    #[id = "tr_attack"]
-    pub transient_attack: FloatParam,
-    
-    #[id = "tr_hold"]
-    pub transient_hold: FloatParam,
-    
-    #[id = "tr_decay"]
-    pub transient_decay: FloatParam,
-    
-    #[id = "tr_release"]
-    pub transient_release: FloatParam,
-    
-    #[id = "tr_level"]
-    pub transient_level: FloatParam,
-
-    // Resonance layer params
-    #[id = "res_delay"]
-    pub resonance_delay: FloatParam,
-    
-    #[id = "res_feedback"]
-    pub resonance_feedback: FloatParam,
-    
-    #[id = "res_level"]
-    pub resonance_level: FloatParam,
-
-    // Snare layer params
-    #[id = "snare_attack"]
-    pub snare_attack: FloatParam,
-    
-    #[id = "snare_decay"]
-    pub snare_decay: FloatParam,
-    
-    #[id = "snare_level"] 
-    pub snare_level: FloatParam,
-    
-    // Overall tone controls
     #[id = "pitch"]
     pub pitch: FloatParam,
+
+    // Impact layer params (transient)
+    #[nested(group = "Impact")]
+    impact_params: ImpactParams,
+    
+    // Tuning layer params (resonance)
+    #[nested(group = "Tuning")]
+    tuning_params: TuningParams,
+
+    // Snare layer params
+    #[nested(group = "Snare")]
+    snare_params: SnareParams,
+}
+
+#[derive(Params)] 
+struct ImpactParams {
+    #[id = "tr_attack"]
+    pub attack: FloatParam,
+    
+    #[id = "tr_hold"]
+    pub hold: FloatParam,
+    
+    #[id = "tr_decay"]
+    pub decay: FloatParam,
+    
+    #[id = "tr_release"]
+    pub release: FloatParam,
+    
+    #[id = "tr_level"]
+    pub level: FloatParam,
+    
+    #[id = "tr_eq_freq"]
+    pub eq_freq: FloatParam,
+    
+    #[id = "tr_eq_gain"]
+    pub eq_gain: FloatParam,
+    
+    #[id = "tr_eq_q"]
+    pub eq_q: FloatParam,
+}
+
+#[derive(Params)]
+struct TuningParams {
+    #[id = "res_delay_samples"]
+    pub delay_samples: FloatParam,
+    
+    #[id = "res_feedback"]
+    pub feedback: FloatParam,
+    
+    #[id = "res_level"]
+    pub level: FloatParam,
+    
+    #[id = "res_eq_freq"]
+    pub eq_freq: FloatParam,
+    
+    #[id = "res_eq_gain"]
+    pub eq_gain: FloatParam,
+    
+    #[id = "res_eq_q"]
+    pub eq_q: FloatParam,
+}
+
+#[derive(Params)]
+struct SnareParams {
+    #[id = "snare_attack"]
+    pub attack: FloatParam,
+    
+    #[id = "snare_decay"]
+    pub decay: FloatParam,
+    
+    #[id = "snare_level"] 
+    pub level: FloatParam,
+    
+    #[id = "snare_eq_freq"]
+    pub eq_freq: FloatParam,
+    
+    #[id = "snare_eq_gain"]
+    pub eq_gain: FloatParam,
+    
+    #[id = "snare_eq_q"]
+    pub eq_q: FloatParam,
 }
 
 impl Default for DrumSynth {
@@ -192,16 +357,245 @@ impl Default for DrumSynth {
 
             transient_envelope: ADSREnvelope::new(44100.0),
             transient_phase: 0.0,
+            transient_eq: PeakEQ::new(),
 
             resonance_buffer: vec![0.0; MAX_DELAY],
             resonance_write_pos: 0,
             resonance_read_pos: 0,
+            resonance_eq: PeakEQ::new(),
 
             noise_envelope: ADSREnvelope::new(44100.0),
+            snare_eq: PeakEQ::new(),
             
             midi_note_id: 0,
             midi_note_freq: 1.0,
             is_playing: false,
+            
+            editor_state: ViziaState::new(|| (1000, 750)),
+        }
+    }
+}
+
+impl Default for ImpactParams {
+    fn default() -> Self {
+        Self {
+            attack: FloatParam::new(
+                "Attack",
+                0.0005, // 0.5ms
+                FloatRange::Skewed {
+                    min: 0.0001,
+                    max: 0.01,
+                    factor: FloatRange::skew_factor(-1.0)
+                },
+            )
+            .with_unit(" s"),
+            
+            hold: FloatParam::new(
+                "Hold",
+                0.0, // 0ms
+                FloatRange::Skewed {
+                    min: 0.0,
+                    max: 0.01,
+                    factor: FloatRange::skew_factor(-1.0)
+                },
+            )
+            .with_unit(" s"),
+            
+            decay: FloatParam::new(
+                "Decay",
+                0.02, // 20ms
+                FloatRange::Skewed {
+                    min: 0.01,
+                    max: 0.03,
+                    factor: FloatRange::skew_factor(-1.0)
+                },
+            )
+            .with_unit(" s"),
+            
+            release: FloatParam::new(
+                "Release",
+                0.015, // 15ms
+                FloatRange::Skewed {
+                    min: 0.01,
+                    max: 0.03,
+                    factor: FloatRange::skew_factor(-1.0)
+                },
+            )
+            .with_unit(" s"),
+            
+            level: FloatParam::new(
+                "Level",
+                0.8,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 1.0,
+                },
+            ),
+            
+            eq_freq: FloatParam::new(
+                "Tone",
+                500.0,
+                FloatRange::Skewed {
+                    min: 100.0,
+                    max: 5000.0,
+                    factor: FloatRange::skew_factor(-1.0)
+                },
+            )
+            .with_unit(" Hz"),
+            
+            eq_gain: FloatParam::new(
+                "Tone Gain",
+                3.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_unit(" dB"),
+            
+            eq_q: FloatParam::new(
+                "Tone Width",
+                1.0,
+                FloatRange::Skewed {
+                    min: 0.1,
+                    max: 10.0,
+                    factor: FloatRange::skew_factor(-1.0)
+                },
+            ),
+        }
+    }
+}
+
+impl Default for TuningParams {
+    fn default() -> Self {
+        Self {
+            delay_samples: FloatParam::new(
+                "Tension",
+                44.0,  // About 1ms @ 44.1kHz
+                FloatRange::Linear {
+                    min: 5.0,  // Very tight head
+                    max: 200.0, // Very loose head
+                },
+            )
+            .with_unit(" samples")
+            .with_step_size(1.0),
+            
+            feedback: FloatParam::new(
+                "Sustain",
+                -0.7,
+                FloatRange::Linear {
+                    min: -0.99, // Long decay
+                    max: -0.3,  // Short decay
+                },
+            ),
+            
+            level: FloatParam::new(
+                "Level",
+                0.8,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 1.0,
+                },
+            ),
+            
+            eq_freq: FloatParam::new(
+                "Tone",
+                800.0,
+                FloatRange::Skewed {
+                    min: 100.0,
+                    max: 5000.0,
+                    factor: FloatRange::skew_factor(-1.0)
+                },
+            )
+            .with_unit(" Hz"),
+            
+            eq_gain: FloatParam::new(
+                "Tone Gain",
+                0.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_unit(" dB"),
+            
+            eq_q: FloatParam::new(
+                "Tone Width",
+                1.0,
+                FloatRange::Skewed {
+                    min: 0.1,
+                    max: 10.0,
+                    factor: FloatRange::skew_factor(-1.0)
+                },
+            ),
+        }
+    }
+}
+
+impl Default for SnareParams {
+    fn default() -> Self {
+        Self {
+            attack: FloatParam::new(
+                "Attack",
+                0.001,
+                FloatRange::Skewed {
+                    min: 0.0001,
+                    max: 0.01,
+                    factor: FloatRange::skew_factor(-1.0)
+                },
+            )
+            .with_unit(" s"),
+            
+            decay: FloatParam::new(
+                "Decay",
+                0.1,
+                FloatRange::Skewed {
+                    min: 0.01,
+                    max: 0.5,
+                    factor: FloatRange::skew_factor(-1.0)
+                },
+            )
+            .with_unit(" s"),
+            
+            level: FloatParam::new(
+                "Level",
+                0.3,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 1.0,
+                },
+            ),
+            
+            eq_freq: FloatParam::new(
+                "Tone",
+                2000.0, // 2kHz
+                FloatRange::Skewed {
+                    min: 500.0,
+                    max: 10000.0,
+                    factor: FloatRange::skew_factor(-1.0)
+                },
+            )
+            .with_unit(" Hz"),
+            
+            eq_gain: FloatParam::new(
+                "Tone Gain",
+                6.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 12.0,
+                },
+            )
+            .with_unit(" dB"),
+            
+            eq_q: FloatParam::new(
+                "Tone Width",
+                1.0,
+                FloatRange::Skewed {
+                    min: 0.1,
+                    max: 5.0,
+                    factor: FloatRange::skew_factor(-1.0)
+                },
+            ),
         }
     }
 }
@@ -221,123 +615,6 @@ impl Default for DrumSynthParams {
             .with_step_size(0.01)
             .with_unit(" dB"),
             
-            // Transient layer params (square osc)
-            transient_attack: FloatParam::new(
-                "Transient Attack",
-                0.0005, // 0.5ms
-                FloatRange::Skewed {
-                    min: 0.0001,
-                    max: 0.01,
-                    factor: FloatRange::skew_factor(-1.0)
-                },
-            )
-            .with_unit(" s"),
-            
-            transient_hold: FloatParam::new(
-                "Transient Hold",
-                0.0, // 0ms
-                FloatRange::Skewed {
-                    min: 0.0,
-                    max: 0.01,
-                    factor: FloatRange::skew_factor(-1.0)
-                },
-            )
-            .with_unit(" s"),
-            
-            transient_decay: FloatParam::new(
-                "Transient Decay",
-                0.02, // 20ms
-                FloatRange::Skewed {
-                    min: 0.01,
-                    max: 0.03,
-                    factor: FloatRange::skew_factor(-1.0)
-                },
-            )
-            .with_unit(" s"),
-            
-            transient_release: FloatParam::new(
-                "Transient Release",
-                0.015, // 15ms
-                FloatRange::Skewed {
-                    min: 0.01,
-                    max: 0.03,
-                    factor: FloatRange::skew_factor(-1.0)
-                },
-            )
-            .with_unit(" s"),
-            
-            transient_level: FloatParam::new(
-                "Transient Level",
-                0.8,
-                FloatRange::Linear {
-                    min: 0.0,
-                    max: 1.0,
-                },
-            ),
-            
-            // Resonance layer params
-            resonance_delay: FloatParam::new(
-                "Resonance Delay",
-                0.001, // 1ms
-                FloatRange::Skewed {
-                    min: 0.0001,
-                    max: 0.01,
-                    factor: FloatRange::skew_factor(-1.0)
-                },
-            )
-            .with_unit(" s"),
-            
-            resonance_feedback: FloatParam::new(
-                "Resonance Feedback",
-                -0.7,
-                FloatRange::Linear {
-                    min: -0.99,
-                    max: -0.3,
-                },
-            ),
-            
-            resonance_level: FloatParam::new(
-                "Resonance Level",
-                0.8,
-                FloatRange::Linear {
-                    min: 0.0,
-                    max: 1.0,
-                },
-            ),
-            
-            // Snare layer params
-            snare_attack: FloatParam::new(
-                "Snare Attack",
-                0.001,
-                FloatRange::Skewed {
-                    min: 0.0001,
-                    max: 0.01,
-                    factor: FloatRange::skew_factor(-1.0)
-                },
-            )
-            .with_unit(" s"),
-            
-            snare_decay: FloatParam::new(
-                "Snare Decay",
-                0.1,
-                FloatRange::Skewed {
-                    min: 0.01,
-                    max: 0.5,
-                    factor: FloatRange::skew_factor(-1.0)
-                },
-            )
-            .with_unit(" s"),
-            
-            snare_level: FloatParam::new(
-                "Snare Level",
-                0.3,
-                FloatRange::Linear {
-                    min: 0.0,
-                    max: 1.0,
-                },
-            ),
-            
-            // Overall tone controls
             pitch: FloatParam::new(
                 "Pitch",
                 60.0, // Middle C
@@ -349,6 +626,10 @@ impl Default for DrumSynthParams {
             .with_smoother(SmoothingStyle::Linear(50.0))
             .with_step_size(1.0)
             .with_unit(""),
+            
+            impact_params: ImpactParams::default(),
+            tuning_params: TuningParams::default(),
+            snare_params: SnareParams::default(),
         }
     }
 }
@@ -380,12 +661,22 @@ impl DrumSynth {
         // Apply envelope to transient
         let envelope = self.transient_envelope.process();
         
-        square * envelope * self.params.transient_level.smoothed.next()
+        // Configure transient EQ
+        self.transient_eq.configure(
+            self.params.impact_params.eq_freq.smoothed.next(), 
+            self.params.impact_params.eq_gain.smoothed.next(),
+            self.params.impact_params.eq_q.smoothed.next(),
+            self.sample_rate
+        );
+        
+        // Apply EQ and level control
+        let output = square * envelope * self.params.impact_params.level.smoothed.next();
+        self.transient_eq.process(output)
     }
     
     fn process_resonance(&mut self, transient_output: f32) -> f32 {
-        // Calculate delay samples based on pitch
-        let delay_samples = (self.params.resonance_delay.smoothed.next() * self.sample_rate) as usize;
+        // Get delay samples directly (not time-based)
+        let delay_samples = self.params.tuning_params.delay_samples.smoothed.next() as usize;
         
         // Ensure delay is within buffer size
         let delay_samples = delay_samples.min(MAX_DELAY - 1);
@@ -397,7 +688,7 @@ impl DrumSynth {
         let delayed_sample = self.resonance_buffer[self.resonance_read_pos];
         
         // Apply feedback - note the negative feedback for resonance
-        let feedback = self.params.resonance_feedback.smoothed.next();
+        let feedback = self.params.tuning_params.feedback.smoothed.next();
         
         // Mix transient input with feedback
         let resonance_input = transient_output + (delayed_sample * feedback);
@@ -408,8 +699,17 @@ impl DrumSynth {
         // Update write position
         self.resonance_write_pos = (self.resonance_write_pos + 1) % MAX_DELAY;
         
-        // Output with level control
-        resonance_input * self.params.resonance_level.smoothed.next()
+        // Configure resonance EQ
+        self.resonance_eq.configure(
+            self.params.tuning_params.eq_freq.smoothed.next(), 
+            self.params.tuning_params.eq_gain.smoothed.next(),
+            self.params.tuning_params.eq_q.smoothed.next(),
+            self.sample_rate
+        );
+        
+        // Apply EQ and level control
+        let output = resonance_input * self.params.tuning_params.level.smoothed.next();
+        self.resonance_eq.process(output)
     }
     
     fn process_snare(&mut self) -> f32 {
@@ -419,11 +719,19 @@ impl DrumSynth {
         // Apply envelope
         let envelope = self.noise_envelope.process();
         
-        // Apply level control
-        noise * envelope * self.params.snare_level.smoothed.next()
+        // Configure snare EQ (for the 2kHz bump)
+        self.snare_eq.configure(
+            self.params.snare_params.eq_freq.smoothed.next(), 
+            self.params.snare_params.eq_gain.smoothed.next(),
+            self.params.snare_params.eq_q.smoothed.next(),
+            self.sample_rate
+        );
+        
+        // Apply EQ and level control
+        let output = noise * envelope * self.params.snare_params.level.smoothed.next();
+        self.snare_eq.process(output)
     }
 }
-
 
 impl Plugin for DrumSynth {
     const NAME: &'static str = "Drum Synth";
@@ -456,12 +764,38 @@ impl Plugin for DrumSynth {
         self.sample_rate = buffer_config.sample_rate;
         self.transient_envelope.sample_rate = buffer_config.sample_rate;
         self.noise_envelope.sample_rate = buffer_config.sample_rate;
+        
+        // Configure EQs with initial values
+        self.transient_eq.configure(
+            self.params.impact_params.eq_freq.value(),
+            self.params.impact_params.eq_gain.value(),
+            self.params.impact_params.eq_q.value(),
+            buffer_config.sample_rate
+        );
+        
+        self.resonance_eq.configure(
+            self.params.tuning_params.eq_freq.value(),
+            self.params.tuning_params.eq_gain.value(),
+            self.params.tuning_params.eq_q.value(),
+            buffer_config.sample_rate
+        );
+        
+        self.snare_eq.configure(
+            self.params.snare_params.eq_freq.value(),
+            self.params.snare_params.eq_gain.value(),
+            self.params.snare_params.eq_q.value(),
+            buffer_config.sample_rate
+        );
 
         true
     }
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+    
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        ui::default_editor(self.params.clone(), self.editor_state.clone())
     }
 
     fn reset(&mut self) {
@@ -471,6 +805,11 @@ impl Plugin for DrumSynth {
         self.is_playing = false;
         self.transient_envelope.state = ADSRState::Idle;
         self.noise_envelope.state = ADSRState::Idle;
+        
+        // Reset EQ states
+        self.transient_eq.reset();
+        self.resonance_eq.reset();
+        self.snare_eq.reset();
         
         // Clear resonance buffer
         for sample in &mut self.resonance_buffer {
@@ -490,18 +829,18 @@ impl Plugin for DrumSynth {
         
         // Update ADSR parameters
         self.transient_envelope.set_parameters(
-            self.params.transient_attack.value(),
-            self.params.transient_decay.value(),
+            self.params.impact_params.attack.value(),
+            self.params.impact_params.decay.value(),
             0.0, // -inf sustain for transient
-            self.params.transient_release.value(),
-            self.params.transient_hold.value(),
+            self.params.impact_params.release.value(),
+            self.params.impact_params.hold.value(),
         );
         
         self.noise_envelope.set_parameters(
-            self.params.snare_attack.value(),
-            self.params.snare_decay.value(),
+            self.params.snare_params.attack.value(),
+            self.params.snare_params.decay.value(),
             0.0, // No sustain for snare
-            self.params.snare_decay.value() * 0.5, // Shorter release
+            self.params.snare_params.decay.value() * 0.5, // Shorter release
             0.0, // No hold
         );
         
