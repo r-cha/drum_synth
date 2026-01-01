@@ -59,17 +59,6 @@ pub(crate) fn default_editor(params: Arc<DrumSynthParams>, editor_state: Arc<Viz
                     .width(Percentage(80.0))
                     .col_between(Percentage(5.0))
                     .height(Percentage(20.0));
-
-                    // Pitch
-                    VStack::new(cx, |cx| {
-                        Label::new(cx, "Pitch").font_size(12.0).color(label_color).text_align(TextAlign::Center);
-                        ParamSlider::new(cx, Data::params, |params| &params.pitch)
-                            .set_style(ParamSliderStyle::CurrentStep { even: true })
-                            .width(Stretch(1.0));
-                    })
-                    .width(Percentage(80.0))
-                    .col_between(Percentage(5.0))
-                    .height(Percentage(20.0));
                 })
                 .width(Percentage(20.0)) // 20% width
                 .background_color(panel_color)
@@ -138,11 +127,12 @@ pub(crate) fn default_editor(params: Arc<DrumSynthParams>, editor_state: Arc<Viz
                         HStack::new(cx, |cx| {
                             make_param(cx, "Ten", |p: &DrumSynthParams| &p.tuning_params.delay_samples);
                             make_param(cx, "Sus", |p: &DrumSynthParams| &p.tuning_params.feedback);
+                            make_param(cx, "Dmp", |p: &DrumSynthParams| &p.tuning_params.damping);
                             make_param(cx, "Lvl", |p: &DrumSynthParams| &p.tuning_params.level);
-                        }).col_between(Percentage(2.0)).width(Percentage(27.0)); // Fewer controls, less width needed
+                        }).col_between(Percentage(2.0)).width(Percentage(36.0));
                         
                         // Spacer
-                        Element::new(cx).width(Stretch(2.0)); // More stretch here
+                        Element::new(cx).width(Stretch(1.0));
 
                         // EQ
                         HStack::new(cx, |cx| {

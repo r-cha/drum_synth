@@ -11,15 +11,12 @@ mod ui;
 /// ~100ms at 44.1kHz sample rate
 const MAX_DELAY: usize = 4096;
 
-// We're not using this filter currently, but keeping it for future use
-#[allow(dead_code)]
 struct OnePoleFilter {
     a0: f32,
     b1: f32,
     z1: f32,
 }
 
-#[allow(dead_code)]
 impl OnePoleFilter {
     fn new() -> Self {
         Self {
@@ -128,18 +125,18 @@ pub struct DrumSynth {
     params: Arc<DrumSynthParams>,
     sample_rate: f32,
 
-    // Transient layer
+    // Transient layer (noise burst)
     transient_envelope: ADSREnvelope,
-    transient_phase: f32,
     transient_eq: PeakEQ,
 
-    // Resonance layer
+    // Resonance layer (Karplus-Strong)
     resonance_buffer: Vec<f32>,
     resonance_write_pos: usize,
     resonance_read_pos: usize,
+    resonance_lowpass: OnePoleFilter, // Damping filter in feedback loop
     resonance_eq: PeakEQ,
 
-    // Noise for snares
+    // Snare noise (fed through resonator)
     noise_envelope: ADSREnvelope,
     snare_eq: PeakEQ,
     
@@ -264,9 +261,6 @@ pub struct DrumSynthParams {
     #[id = "gain"]
     pub gain: FloatParam,
 
-    #[id = "pitch"]
-    pub pitch: FloatParam,
-
     // Impact layer params (transient)
     #[nested(group = "Impact")]
     impact_params: ImpactParams,
@@ -315,6 +309,9 @@ struct TuningParams {
     #[id = "res_feedback"]
     pub feedback: FloatParam,
     
+    #[id = "res_damping"]
+    pub damping: FloatParam,
+    
     #[id = "res_level"]
     pub level: FloatParam,
     
@@ -356,12 +353,12 @@ impl Default for DrumSynth {
             sample_rate: 44100.0,
 
             transient_envelope: ADSREnvelope::new(44100.0),
-            transient_phase: 0.0,
             transient_eq: PeakEQ::new(),
 
             resonance_buffer: vec![0.0; MAX_DELAY],
             resonance_write_pos: 0,
             resonance_read_pos: 0,
+            resonance_lowpass: OnePoleFilter::new(),
             resonance_eq: PeakEQ::new(),
 
             noise_envelope: ADSREnvelope::new(44100.0),
@@ -486,6 +483,15 @@ impl Default for TuningParams {
                 FloatRange::Linear {
                     min: -0.99, // Long decay
                     max: -0.3,  // Short decay
+                },
+            ),
+            
+            damping: FloatParam::new(
+                "Damping",
+                0.5, // Middle damping
+                FloatRange::Linear {
+                    min: 0.1,  // Bright (less filtering)
+                    max: 0.9,  // Dark (more filtering)
                 },
             ),
             
@@ -615,18 +621,6 @@ impl Default for DrumSynthParams {
             .with_step_size(0.01)
             .with_unit(" dB"),
             
-            pitch: FloatParam::new(
-                "Pitch",
-                60.0, // Middle C
-                FloatRange::Linear {
-                    min: 36.0, // C2
-                    max: 84.0, // C6
-                },
-            )
-            .with_smoother(SmoothingStyle::Linear(50.0))
-            .with_step_size(1.0)
-            .with_unit(""),
-            
             impact_params: ImpactParams::default(),
             tuning_params: TuningParams::default(),
             snare_params: SnareParams::default(),
@@ -635,28 +629,14 @@ impl Default for DrumSynthParams {
 }
 
 impl DrumSynth {
-    fn calculate_square(&mut self, frequency: f32) -> f32 {
-        let phase_delta = frequency / self.sample_rate;
-        
-        // Simple square wave
-        let square = if self.transient_phase < 0.5 { 1.0 } else { -1.0 };
-
-        self.transient_phase += phase_delta;
-        if self.transient_phase >= 1.0 {
-            self.transient_phase -= 1.0;
-        }
-
-        square
-    }
-    
     fn calculate_noise() -> f32 {
         let mut rng = rand::thread_rng();
         rng.gen_range(-1.0..1.0)
     }
     
-    fn process_transient(&mut self, frequency: f32) -> f32 {
-        // Get square wave for transient
-        let square = self.calculate_square(frequency);
+    fn process_transient(&mut self) -> f32 {
+        // Use white noise burst for transient (not square wave)
+        let noise = Self::calculate_noise();
         
         // Apply envelope to transient
         let envelope = self.transient_envelope.process();
@@ -670,11 +650,31 @@ impl DrumSynth {
         );
         
         // Apply EQ and level control
-        let output = square * envelope * self.params.impact_params.level.smoothed.next();
+        let output = noise * envelope * self.params.impact_params.level.smoothed.next();
         self.transient_eq.process(output)
     }
     
-    fn process_resonance(&mut self, transient_output: f32) -> f32 {
+    fn process_snare_input(&mut self) -> f32 {
+        // Generate noise for snare wires
+        let noise = Self::calculate_noise();
+        
+        // Apply envelope
+        let envelope = self.noise_envelope.process();
+        
+        // Configure snare EQ (for the 2kHz bump)
+        self.snare_eq.configure(
+            self.params.snare_params.eq_freq.smoothed.next(), 
+            self.params.snare_params.eq_gain.smoothed.next(),
+            self.params.snare_params.eq_q.smoothed.next(),
+            self.sample_rate
+        );
+        
+        // Apply EQ and level control
+        let output = noise * envelope * self.params.snare_params.level.smoothed.next();
+        self.snare_eq.process(output)
+    }
+    
+    fn process_resonance(&mut self, transient_output: f32, snare_output: f32) -> f32 {
         // Get delay samples directly (not time-based)
         let delay_samples = self.params.tuning_params.delay_samples.smoothed.next() as usize;
         
@@ -687,11 +687,17 @@ impl DrumSynth {
         // Read from delay buffer at the delayed position
         let delayed_sample = self.resonance_buffer[self.resonance_read_pos];
         
+        // Apply lowpass filter (damping) to feedback - key part of Karplus-Strong
+        let damping = self.params.tuning_params.damping.smoothed.next();
+        self.resonance_lowpass.set_cutoff(1.0 - damping, true);
+        let filtered_feedback = self.resonance_lowpass.process(delayed_sample);
+        
         // Apply feedback - note the negative feedback for resonance
         let feedback = self.params.tuning_params.feedback.smoothed.next();
         
-        // Mix transient input with feedback
-        let resonance_input = transient_output + (delayed_sample * feedback);
+        // Mix transient + snare input with filtered feedback
+        // Both transient and snare noise feed into the resonator
+        let resonance_input = transient_output + snare_output + (filtered_feedback * feedback);
         
         // Write to buffer
         self.resonance_buffer[self.resonance_write_pos] = resonance_input;
@@ -710,26 +716,6 @@ impl DrumSynth {
         // Apply EQ and level control
         let output = resonance_input * self.params.tuning_params.level.smoothed.next();
         self.resonance_eq.process(output)
-    }
-    
-    fn process_snare(&mut self) -> f32 {
-        // Generate noise for snare
-        let noise = Self::calculate_noise();
-        
-        // Apply envelope
-        let envelope = self.noise_envelope.process();
-        
-        // Configure snare EQ (for the 2kHz bump)
-        self.snare_eq.configure(
-            self.params.snare_params.eq_freq.smoothed.next(), 
-            self.params.snare_params.eq_gain.smoothed.next(),
-            self.params.snare_params.eq_q.smoothed.next(),
-            self.sample_rate
-        );
-        
-        // Apply EQ and level control
-        let output = noise * envelope * self.params.snare_params.level.smoothed.next();
-        self.snare_eq.process(output)
     }
 }
 
@@ -799,16 +785,16 @@ impl Plugin for DrumSynth {
     }
 
     fn reset(&mut self) {
-        self.transient_phase = 0.0;
         self.midi_note_id = 0;
         self.midi_note_freq = 1.0;
         self.is_playing = false;
         self.transient_envelope.state = ADSRState::Idle;
         self.noise_envelope.state = ADSRState::Idle;
         
-        // Reset EQ states
+        // Reset filter states
         self.transient_eq.reset();
         self.resonance_eq.reset();
+        self.resonance_lowpass.reset();
         self.snare_eq.reset();
         
         // Clear resonance buffer
@@ -871,20 +857,13 @@ impl Plugin for DrumSynth {
                 next_event = context.next_event();
             }
             
-            // Determine frequency (either from MIDI or from pitch parameter)
-            let frequency = if self.is_playing {
-                self.midi_note_freq
-            } else {
-                util::midi_note_to_freq(self.params.pitch.smoothed.next() as u8)
-            };
+            // Process each layer - snare feeds through resonator per Karplus-Strong
+            let transient_output = self.process_transient();
+            let snare_output = self.process_snare_input();
+            let resonance_output = self.process_resonance(transient_output, snare_output);
             
-            // Process each layer
-            let transient_output = self.process_transient(frequency);
-            let resonance_output = self.process_resonance(transient_output);
-            let snare_output = self.process_snare();
-            
-            // Mix all layers
-            let output = (transient_output + resonance_output + snare_output) 
+            // Resonance output contains both transient and snare processed through delay
+            let output = (transient_output + resonance_output) 
                 * util::db_to_gain_fast(self.params.gain.smoothed.next());
                 
             // Apply to all channels
